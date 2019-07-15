@@ -24,7 +24,6 @@ except ImportError:
 else:
     WIN_PLATFORM = False
 from socket import gaierror as sock_gaierror, error as sock_error
-from time import sleep
 from warnings import warn
 
 from gevent import sleep, socket, get_hub, spawn
@@ -77,6 +76,7 @@ class SSHClient(object):
                  kex_algorithms=None,
                  ciphers=None,
                  MACs=None,
+                 read_chunk_size=1024,
                  _auth_thread_pool=True, keepalive_seconds=60, eagain_sleep=0.1, max_tries=30):
         """:param host: Host name or IP to connect to.
         :type host: str
@@ -146,6 +146,7 @@ class SSHClient(object):
         self._keepalive_greenlet = None
         self._host = proxy_host if proxy_host else host
         self.pkey = _validate_pkey_path(pkey, self.host)
+        self.read_chunk_size = read_chunk_size
         self._connect(self._host, self.port)
         if _auth_thread_pool:
             THREAD_POOL.apply(self._init)
@@ -730,20 +731,28 @@ class SSHClient(object):
         local_fh = open(local_file, 'wb')
         try:
             total = 0
-            size, data = file_chan.read(size=fileinfo.st_size)
+            size, data = file_chan.read(self.read_chunk_size)
             while size == LIBSSH2_ERROR_EAGAIN:
                 wait_select(self.session)
-                size, data = file_chan.read(size=fileinfo.st_size)
+                size, data = file_chan.read(self.read_chunk_size)
             total += size
+            logger.info(f'total size = {total}')
             local_fh.write(data)
             while total < fileinfo.st_size:
-                size, data = file_chan.read(size=fileinfo.st_size - total)
-                while size == LIBSSH2_ERROR_EAGAIN:
-                    wait_select(self.session)
+                size, data = file_chan.read(self.read_chunk_size)
+                if size == LIBSSH2_ERROR_EAGAIN:
                     continue
                 total += size
+                logger.info(f'total size = {total}')
                 local_fh.write(data)
-            if total != fileinfo.st_size:
+            # dropbear may or may not EOF terminate the stream it seems
+            if total == (fileinfo.st_size + 1) and data[-1:] == b'\x00':
+                # golden
+                local_fh.truncate((total-1))
+            elif total == fileinfo.st_size and data[-1:] != b'\x00':
+                # also golden
+                pass
+            else:
                 msg = "Error copying data from remote file %s on host %s. " \
                       "Copied %s out of %s total bytes"
                 raise SCPError(msg, remote_file, self.host, total,
